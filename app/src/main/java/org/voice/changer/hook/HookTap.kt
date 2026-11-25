@@ -38,6 +38,8 @@ class HookTap(
 
     private val inFrames = AtomicLong(0)
     private val outFrames = AtomicLong(0)
+    /** Capture handed to the app side during the current stream. */
+    private val fedFrames = AtomicLong(0)
     private val stalls = AtomicInteger(0)
     private val stallMs = AtomicLong(0)
 
@@ -64,6 +66,7 @@ class HookTap(
         lastAt = System.currentTimeMillis()
         lastFeedAt = lastAt
         inFrames.addAndGet(mono.size.toLong())
+        fedFrames.addAndGet(mono.size.toLong())
         synchronized(sendLock) {
             while (running && send.free < mono.size) sendLock.wait(20)
             if (!running) return
@@ -92,6 +95,15 @@ class HookTap(
     @Volatile var needFrames = 0
         private set
 
+    /**
+     * Wall-clock budget the backend needs before its first block can exist, as
+     * reported by the app side. A stream waits this long before deciding that
+     * the engine wants more capture; a fixed short wait made the hook re-read a
+     * whole read-ahead every time and left that surplus in the stream forever.
+     */
+    @Volatile var firstBlockMs = DEFAULT_FIRST_MS
+        private set
+
     /** Last time this stream fed capture; a long gap means a new stream. */
     private var lastFeedAt = 0L
 
@@ -106,9 +118,22 @@ class HookTap(
         if (now - lastFeedAt > STREAM_GAP_MS) {
             primed = false
             needFrames = 0
+            fedFrames.set(0)
         }
         if (needFrames > 0 || primed) return
-        needFrames = HookRemote.need(key, pkg, rate, channels)
+        val (frames, firstMs) = HookRemote.need(key, pkg, rate, channels)
+        needFrames = frames
+        if (firstMs > 0) firstBlockMs = firstMs
+    }
+
+    /**
+     * Capture this stream still has to read ahead (frames at [rate]) to satisfy
+     * the engine's start-up context. Zero when the app side has not reported a
+     * demand yet.
+     */
+    fun preRollTarget(): Int {
+        if (needFrames <= 0) return 0
+        return (needFrames - fedFrames.get()).coerceAtLeast(0L).toInt()
     }
 
     /**
@@ -249,6 +274,8 @@ class HookTap(
         const val MAX_CHUNK = 4_000
         /** Silence longer than this ends a stream. */
         const val STREAM_GAP_MS = 1_500L
+        /** Used until the app side reports the backend's real budget. */
+        const val DEFAULT_FIRST_MS = 900
     }
 }
 

@@ -251,7 +251,10 @@ object HookBridge {
             val channels = extras.getInt("channels", 1)
             engage(key, pkg, rate, channels, ctx) ?: return Bundle()
         }
-        return Bundle().apply { putInt("need", session.needWithin(300)) }
+        return Bundle().apply {
+            putInt("need", session.needWithin(300))
+            putInt("firstMs", session.firstBlockMs())
+        }
     }
 
     fun reportCall(extras: Bundle?) {

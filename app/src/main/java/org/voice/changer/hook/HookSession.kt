@@ -181,6 +181,19 @@ class HookSession(
     }
 
     /**
+     * Wall-clock time the backend needs before its first block can exist: the
+     * capture it buffers plus one emission, plus room for the inference itself.
+     * The hook waits this long before concluding that the engine wants more
+     * capture, instead of a fixed wait shorter than the backend's own start-up.
+     */
+    fun firstBlockMs(): Int {
+        val e = engine ?: return 900
+        val buffered = e.coldStartSamples +
+            (e.requiredSamples - e.outputSamples).coerceAtLeast(0L)
+        return (buffered.coerceAtLeast(0L) * 1000 / 16_000).toInt() + 400
+    }
+
+    /**
      * Feeds one capture buffer and returns whatever converted audio is ready,
      * up to [pcm] frames.
      *

@@ -158,18 +158,18 @@ object HookRemote {
      * this before reading ahead is what keeps the pre-roll from becoming
      * permanent delay.
      */
-    fun need(key: String, pkg: String, rate: Int, channels: Int): Int {
-        val ctx = context() ?: return 0
+    fun need(key: String, pkg: String, rate: Int, channels: Int): Pair<Int, Int> {
+        val ctx = context() ?: return 0 to 0
         return try {
             val reply = ctx.contentResolver.call(uri, "need", null, Bundle().apply {
                 putString("key", key)
                 putString("pkg", pkg)
                 putInt("rate", rate)
                 putInt("channels", channels)
-            }) ?: return 0
-            reply.getInt("need", 0)
+            }) ?: return 0 to 0
+            reply.getInt("need", 0) to reply.getInt("firstMs", 0)
         } catch (t: Throwable) {
-            0
+            0 to 0
         }
     }
 
