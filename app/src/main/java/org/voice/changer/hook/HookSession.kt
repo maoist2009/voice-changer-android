@@ -66,7 +66,7 @@ class HookSession(
 
     private val inLock = Object()
     private val ring = FloatArray(16_000 * RING_SECONDS)
-    private var received = 0L
+    @Volatile private var received = 0L
 
     /** End-to-end delay of the last served buffer: capture time -> read time. */
     @Volatile var lastLatencyMs = 0L
@@ -150,6 +150,28 @@ class HookSession(
 
     /** Capture samples this stream starts from; the debug harness times with it. */
     fun baseSamples(): Long = inputBase
+
+    /**
+     * Capture (at the target rate) the engine still needs before it can emit.
+     * The hook reads exactly this much ahead at stream start: more would become
+     * permanent delay, less would deadlock.
+     */
+    fun neededFrames(): Int {
+        val e = engine ?: return 0
+        val pending = (e.requiredSamples - received).coerceAtLeast(0L)
+        return (pending * rate / 16_000).toInt()
+    }
+
+    /**
+     * Same as [neededFrames] but waits up to [maxMs] for the engine to exist.
+     * A guess here is expensive twice over: too small deadlocks the stream, too
+     * large turns into permanent delay.
+     */
+    fun needWithin(maxMs: Long): Int {
+        val deadline = System.currentTimeMillis() + maxMs
+        while (engine == null && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        return neededFrames()
+    }
 
     /**
      * Feeds one capture buffer and returns whatever converted audio is ready,

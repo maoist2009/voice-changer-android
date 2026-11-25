@@ -200,22 +200,7 @@ object HookBridge {
         val channels = extras.getInt("channels", 1)
         if (rate <= 0) return Bundle()
 
-        val session = existing ?: run {
-            // Engage decision, made once per stream and never revisited: a
-            // stream that is converted stays converted, and one that is not
-            // stays untouched for its whole life. Disabling the hook therefore
-            // affects the next recording, not the one in progress.
-            if (LiveService.micActive || !HookSettings.enabled(ctx)) return Bundle()
-            val fresh = HookSession(key, pkg, rate, channels, ctx)
-            val raced = sessions.putIfAbsent(key, fresh)
-            if (raced != null) {
-                fresh.close()
-                raced
-            } else {
-                Log.i(TAG, "session $key opened (${pcm.size} frames/buffer)")
-                fresh
-            }
-        }
+        val session = existing ?: engage(key, pkg, rate, channels, ctx) ?: return Bundle()
         lastBaseSamples = session.baseSamples()
         val out = session.exchange(pcm)
         lastPkg = pkg
@@ -224,6 +209,44 @@ object HookBridge {
         // Answer every accepted buffer: an empty array means "accepted, nothing
         // converted yet", which the hook must not confuse with "not accepted".
         return Bundle().apply { putFloatArray("pcm", out) }
+    }
+
+    /**
+     * Engage decision, made once per stream and never revisited: a stream that
+     * is converted stays converted, and one that is not stays untouched for its
+     * whole life. Disabling the hook therefore affects the next recording, not
+     * the one in progress.
+     */
+    private fun engage(key: String, pkg: String, rate: Int, channels: Int, ctx: Context): HookSession? {
+        if (LiveService.micActive || !HookSettings.enabled(ctx)) return null
+        val fresh = HookSession(key, pkg, rate, channels, ctx)
+        val raced = sessions.putIfAbsent(key, fresh)
+        if (raced != null) {
+            fresh.close()
+            return raced
+        }
+        Log.i(TAG, "session $key opened")
+        return fresh
+    }
+
+    /**
+     * How much capture the engine still needs before it can emit, in frames at
+     * the target rate. The hook asks before it reads ahead: a fixed amount
+     * either deadlocks (too little) or becomes permanent delay (too much).
+     */
+    fun needCall(extras: Bundle?): Bundle {
+        val ctx = appContext ?: return Bundle()
+        if (extras == null) return Bundle()
+        holdWake(ctx)
+        val key = extras.getString("key") ?: return Bundle()
+        val rate = extras.getInt("rate")
+        if (rate <= 0) return Bundle()
+        val session = sessions[key] ?: run {
+            val pkg = extras.getString("pkg") ?: return Bundle()
+            val channels = extras.getInt("channels", 1)
+            engage(key, pkg, rate, channels, ctx) ?: return Bundle()
+        }
+        return Bundle().apply { putInt("need", session.needWithin(300)) }
     }
 
     fun reportCall(extras: Bundle?) {

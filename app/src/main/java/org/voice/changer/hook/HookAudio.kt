@@ -51,6 +51,9 @@ object HookAudio {
     /** Reads ahead at most this much capture (the engine's own look-ahead is 262 ms). */
     private const val PREROLL_MS = 500L
     private const val PREROLL_TIMEOUT_MS = 5_000L
+    /** How long a primed stream waits before reading ahead once more. */
+    private const val PREROLL_WAIT_MS = 250L
+    private const val PREROLL_RETRIES = 6
 
     fun intercept(param: XC_MethodHook.MethodHookParam, pkg: String, process: String) {
         if (preRolling.get() == true) return
@@ -90,13 +93,28 @@ object HookAudio {
         if (mono.isEmpty()) return
 
         val tap = HookTaps.get(pkg, process, rate, channels)
+        // Ask the engine how much capture it needs before it can emit anything.
+        // Reading ahead a fixed amount either deadlocks (too little) or becomes
+        // permanent delay (too much).
+        tap.fetchNeed()
         tap.enqueue(mono)
         // The engine cannot emit its first block until it has capture to look
         // ahead over, and only this thread can produce that capture. Read ahead
-        // until something is converted, then block for it: the read-ahead audio
+        // until something is converted, then wait for it: the read-ahead audio
         // is queued like any other and comes back, in order, on later calls.
-        preRoll(param, args, channels, encoding, start, tap, mono.size, rate * PREROLL_MS.toInt() / 1000, tracing)
-        val out = tap.await(mono.size)
+        val cap = if (tap.needFrames > 0) maxOf(tap.needFrames, mono.size) else rate * PREROLL_MS.toInt() / 1000
+        preRoll(param, args, channels, encoding, start, tap, mono.size, cap, tracing)
+        var out = tap.tryAwait(mono.size, PREROLL_WAIT_MS)
+        if (out == null && !tap.primed) {
+            // The engine wanted more than the app side reported (cold start or a
+            // rebuilt engine). Read ahead again rather than idling forever.
+            var tries = 0
+            while (out == null && tries++ < PREROLL_RETRIES) {
+                preRoll(param, args, channels, encoding, start, tap, mono.size, cap, tracing)
+                out = tap.tryAwait(mono.size, PREROLL_WAIT_MS)
+            }
+        }
+        out = out ?: tap.await(mono.size)
         val t2 = System.nanoTime()
         if (out == null) {
             if (tracing) trace("skip: stream closed while waiting for ${mono.size} frames")

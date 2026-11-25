@@ -153,6 +153,26 @@ object HookRemote {
         }
     }
 
+    /**
+     * Asks how much capture the engine still needs before it can emit. Doing
+     * this before reading ahead is what keeps the pre-roll from becoming
+     * permanent delay.
+     */
+    fun need(key: String, pkg: String, rate: Int, channels: Int): Int {
+        val ctx = context() ?: return 0
+        return try {
+            val reply = ctx.contentResolver.call(uri, "need", null, Bundle().apply {
+                putString("key", key)
+                putString("pkg", pkg)
+                putInt("rate", rate)
+                putInt("channels", channels)
+            }) ?: return 0
+            reply.getInt("need", 0)
+        } catch (t: Throwable) {
+            0
+        }
+    }
+
     fun report(pkg: String, frames: Long) {
         val ctx = context() ?: return
         try {

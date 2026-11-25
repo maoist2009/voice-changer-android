@@ -62,6 +62,7 @@ class HookTap(
     /** Hands capture to the engine. Never drops: a full queue makes it wait. */
     fun enqueue(mono: FloatArray) {
         lastAt = System.currentTimeMillis()
+        lastFeedAt = lastAt
         inFrames.addAndGet(mono.size.toLong())
         synchronized(sendLock) {
             while (running && send.free < mono.size) sendLock.wait(20)
@@ -82,6 +83,33 @@ class HookTap(
     /** Set once a read has been served: priming is a stream-start concern only. */
     @Volatile var primed = false
         private set
+
+    /**
+     * Capture this stream must read ahead (frames at [rate]) before the engine
+     * can emit its first block, as reported by the app side. Zero means the
+     * engine has not been built yet.
+     */
+    @Volatile var needFrames = 0
+        private set
+
+    /** Last time this stream fed capture; a long gap means a new stream. */
+    private var lastFeedAt = 0L
+
+    /**
+     * Asks the app side once per stream; the engine's demand is stable. A gap in
+     * the feed means the previous stream ended (its session closed), so the
+     * priming state has to be forgotten or the next stream would start without
+     * any read-ahead and deadlock.
+     */
+    fun fetchNeed() {
+        val now = System.currentTimeMillis()
+        if (now - lastFeedAt > STREAM_GAP_MS) {
+            primed = false
+            needFrames = 0
+        }
+        if (needFrames > 0 || primed) return
+        needFrames = HookRemote.need(key, pkg, rate, channels)
+    }
 
     /**
      * Waits for [n] converted frames. Returns null only when the stream is
@@ -114,6 +142,32 @@ class HookTap(
         outFrames.addAndGet(out.size.toLong())
         primed = true
         return out
+    }
+
+    /**
+     * Like [await] but gives up after [ms]. Null means "nothing yet"; the caller
+     * distinguishes it from a closed stream by [primed]/[hasOutput].
+     */
+    fun tryAwait(n: Int, ms: Long): FloatArray? {
+        val deadline = System.nanoTime() + ms * 1_000_000
+        waiting = true
+        try {
+            synchronized(recvLock) {
+                var ready = recv.read(n)
+                while (running && ready == null && System.nanoTime() < deadline) {
+                    lastAt = System.currentTimeMillis()
+                    recvLock.wait(5)
+                    ready = recv.read(n)
+                }
+                if (ready == null) return null
+                lastAt = System.currentTimeMillis()
+                outFrames.addAndGet(ready.size.toLong())
+                primed = true
+                return ready
+            }
+        } finally {
+            waiting = false
+        }
     }
 
     fun close() {
@@ -193,6 +247,8 @@ class HookTap(
 
     private companion object {
         const val MAX_CHUNK = 4_000
+        /** Silence longer than this ends a stream. */
+        const val STREAM_GAP_MS = 1_500L
     }
 }
 

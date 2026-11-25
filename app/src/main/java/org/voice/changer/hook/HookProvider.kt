@@ -20,6 +20,7 @@ class HookProvider : ContentProvider() {
         private const val TAG = "hook_provider"
         const val METHOD_CONFIG = "config"
         const val METHOD_PROCESS = "process"
+        const val METHOD_NEED = "need"
         const val METHOD_REPORT = "report"
         const val METHOD_HELLO = "hello"
     }
@@ -55,6 +56,7 @@ class HookProvider : ContentProvider() {
                 Bundle()
             }
             METHOD_PROCESS -> HookBridge.processCall(extras)
+            METHOD_NEED -> HookBridge.needCall(extras)
             METHOD_REPORT -> {
                 HookBridge.reportCall(extras)
                 Bundle()

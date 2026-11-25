@@ -31,8 +31,22 @@ data class EngineInfo(
  * loaded would invite the low-memory killer.
  */
 object EngineHub {
-    /** 120 ms chunks: the live loop needs ~2 chunks of look-ahead, and 8 would leave no CPU headroom. */
-    const val CHUNK_FRAMES = 12
+    /**
+     * Frames per inference. This is the dominant latency lever, because the
+     * engine needs two chunks of look-ahead and emits one chunk per call:
+     *
+     * | chunk | look-ahead | emit | inference | measured end to end |
+     * |-------|-----------|------|-----------|---------------------|
+     * |  12   | 262 ms    | 120  | 28-40 ms  | 479 ms              |
+     * |   8   | 182 ms    |  80  | 24-36 ms  | 220-300 ms          |
+     * |   4   | 102 ms    |  40  | 16-27 ms  | 180-260 ms          |
+     *
+     * The graphs are built per chunk from the same weights, so the chunk size
+     * costs CPU, not quality; 4 is the floor (the phone graph needs a multiple
+     * of four). 8 leaves 2-3x headroom, which is what a screen-off recording
+     * needs when the device is busy.
+     */
+    const val CHUNK_FRAMES = 8
     const val ATTN_POSITIONS = 64
 
     private const val TAG = "engine_hub"
