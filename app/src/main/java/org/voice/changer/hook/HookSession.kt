@@ -114,6 +114,9 @@ class HookSession(
      * ring keeps counting capture, so the two have to be related to time the
      * real delay.
      */
+    /** First `next()` call of this session; used to time the backend's cold path. */
+    private var firstNextAt = 0L
+
     @Volatile private var latencyBase = 0L
 
     init {
@@ -158,7 +161,11 @@ class HookSession(
      */
     fun neededFrames(): Int {
         val e = engine ?: return 0
-        val pending = (e.requiredSamples - received).coerceAtLeast(0L)
+        // The step requirement is not the whole story: RVC emits nothing until
+        // its 420 ms context is full, and a stream primed with less than that
+        // waits forever for output that only more capture could produce.
+        val pending = maxOf(e.requiredSamples - received, e.coldStartSamples - received)
+            .coerceAtLeast(0L)
         return (pending * rate / 16_000).toInt()
     }
 
@@ -292,9 +299,15 @@ class HookSession(
             status = "running"
             val source = PcmSource { i -> if (i < start || i >= end) 0f else snapshot[i - start] }
             try {
+                if (firstNextAt == 0L) {
+                    firstNextAt = System.nanoTime()
+                    Log.i(TAG, "first next() for ${processor.javaClass.simpleName} " +
+                        "need=${processor.requiredSamples} received=$received")
+                }
                 val t0 = System.nanoTime()
                 val part = processor.next(source)
                 lastInferMs = (System.nanoTime() - t0) / 1_000_000.0
+                if (lastInferMs > 1_000) Log.w(TAG, "next took ${lastInferMs.toInt()} ms")
                 if (part.audio.isEmpty()) continue
                 val resampler = outResampler ?: continue
                 val out = resampler.process(part.audio)

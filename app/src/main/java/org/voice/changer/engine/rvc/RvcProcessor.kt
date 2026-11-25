@@ -24,6 +24,8 @@ class RvcProcessor(
     companion object {
         private const val TAG = "rvc_processor"
         private const val FEED_STRIDE = 4000
+        /** Input the native pipeline buffers before its first emission. */
+        private const val MIN_INPUT = 6_720L
     }
 
     @Volatile private var params = EngineParams()
@@ -32,6 +34,14 @@ class RvcProcessor(
     @Volatile private var lastError: String? = null
 
     override val outputSamples: Long get() = fed.toLong()
+
+    /**
+     * The native pipeline cannot emit before it has 6720 samples (420 ms) of
+     * input, so that is how much a stream has to read ahead at its start. The
+     * hook asks for exactly this instead of guessing: less deadlocks the stream,
+     * more becomes permanent delay.
+     */
+    override val coldStartSamples: Long get() = MIN_INPUT
 
     /**
      * 25 ms steps: the native pipeline can only emit a block once it has

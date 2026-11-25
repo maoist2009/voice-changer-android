@@ -77,6 +77,12 @@ object HookBridge {
      * audio long after the target app has started, so paying that cost when
      * this process starts is what makes a recording convert from its first
      * block instead of losing the first seconds to raw audio.
+     *
+     * Load only, never feed. The RVC pipeline is single threaded: a stream can
+     * open on its own thread while this one is still starting up, and feeding
+     * from both aborts the process (measured: libc++abi terminating 20 ms after
+     * a warm-up that overlapped a live stream). The session warms its own
+     * engine from the thread that will drive it.
      */
     fun warm() {
         val ctx = appContext ?: return
@@ -90,9 +96,8 @@ object HookBridge {
             try {
                 val t0 = SystemClock.elapsedRealtime()
                 val params = HookSettings.engineParams(ctx)
-                EngineHub.ensureDefault(ctx, params).let { EngineHub.processor }
-                    ?.let { EngineHub.warmup(it) }
-                Log.i(TAG, "engine warm in ${SystemClock.elapsedRealtime() - t0} ms")
+                EngineHub.ensureDefault(ctx, params)
+                Log.i(TAG, "engine loaded in ${SystemClock.elapsedRealtime() - t0} ms")
             } catch (t: Throwable) {
                 Log.w(TAG, "warm-up failed: ${t.message}")
             } finally {

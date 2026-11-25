@@ -176,13 +176,18 @@ object EngineHub {
      * The first inference after a load is several times slower (NPU queues,
      * CPU kernels, first-touch page faults). Doing it here — while no real
      * audio is waiting — keeps that spike out of the first hooked buffer.
+     *
+     * Must run on the thread that will drive the processor: the RVC pipeline is
+     * single threaded and aborts the process if two threads feed it.
      */
     fun warmup(processor: LiveProcessor) {
         runCatching {
             processor.reset()
             val silence = PcmSource { 0f }
             var steps = 0
-            while (processor.outputSamples < 9_000 && steps < 12) {
+            // RVC needs 6720 samples (420 ms) before it can emit anything, and
+            // the point of a warm-up is to reach that first emission.
+            while (processor.outputSamples < 9_000 && steps < 40) {
                 processor.next(silence)
                 steps++
             }

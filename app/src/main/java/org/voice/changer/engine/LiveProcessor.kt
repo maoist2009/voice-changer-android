@@ -18,6 +18,12 @@ interface LiveProcessor {
     /** Absolute input index that must be buffered before [next] can run. */
     val requiredSamples: Int
 
+    /**
+     * Input samples that must have been fed before the first output sample can
+     * appear. Zero when a backend emits from its very first step.
+     */
+    val coldStartSamples: Long get() = 0L
+
     /** Clears all streaming state so the next sample is a fresh start. */
     fun reset()
 
