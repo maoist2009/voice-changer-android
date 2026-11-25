@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "Voice Changer"
 include(":app")
+include(":lab")

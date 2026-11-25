@@ -190,10 +190,15 @@ class LiveService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
+        val wasLive = micActive
         running = false
         micActive = false
         instance = null
-        HookBridge.detach()
+        // In hook-only mode this service is a keep-alive around the provider, so
+        // tearing the bridge down here would kill a recording that is still
+        // converting (it did exactly that once). Only the microphone loop owns
+        // the engine and is allowed to drop streams.
+        if (wasLive) HookBridge.detach()
         debugPlaying.set(false)
         runCatching { debugPlayer?.stop() }
         runCatching { debugPlayer?.release() }

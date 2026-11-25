@@ -21,7 +21,6 @@ data class HookStats(
     val lookaheadMs: Int,
     val queueMs: Int,
     val inferMs: Double,
-    val primeMs: Int,
     /** 16 kHz samples of capture dropped when the engine took over. */
     val baseSamples: Long = 0L,
     /** Measured capture-to-hand-over delay of the last served buffer. */
@@ -49,21 +48,14 @@ class HookSession(
     companion object {
         private const val TAG = "hook_session"
         private const val RING_SECONDS = 4
-        private const val OUTPUT_SECONDS = 1.0
-
         /**
-         * Emits before the stream counts as warm. The first blocks pay for
-         * engine load and the first NPU calls and run 2-3x slower than steady
-         * state, so a dropout there must not size the queue for the whole call.
+         * Converted audio waiting to be handed back. Large on purpose: the
+         * queue is allowed to grow while the engine catches up, it is never
+         * trimmed, and a recording must not lose content to a burst.
          */
-        private const val WARMUP_BLOCKS = 12
+        private const val OUTPUT_SECONDS = 6.0
 
-        /**
-         * Cushion the last session settled on. Process-wide so switching
-         * between apps (each gets its own session) does not relearn it, and
-         * deliberately not persisted: a reboot starts optimistic again.
-         */
-        @Volatile private var learnedPrimeMs = 0
+        private val EMPTY = FloatArray(0)
     }
 
     private val inResampler = StreamResampler(rate, 16_000)
@@ -74,37 +66,28 @@ class HookSession(
 
     private val inLock = Object()
     private val ring = FloatArray(16_000 * RING_SECONDS)
-    /** Wall-clock capture time of each ring slot; used to measure real delay. */
-    private val ringAt = LongArray(16_000 * RING_SECONDS)
     private var received = 0L
-
-    /** Converted samples thrown away by a queue trim (shifts the mapping). */
-    private var outDropped = 0L
 
     /** End-to-end delay of the last served buffer: capture time -> read time. */
     @Volatile var lastLatencyMs = 0L
         private set
 
+    // Counters: the numbers that prove a stream was converted end to end.
+    private val inFrames = java.util.concurrent.atomic.AtomicLong(0)
+    private val outFrames = java.util.concurrent.atomic.AtomicLong(0)
+    private val stalls = java.util.concurrent.atomic.AtomicInteger(0)
+    private val stallMs = java.util.concurrent.atomic.AtomicLong(0)
+    /** Must stay zero: a non-zero value means raw audio reached the target. */
+    private val rawBlocks = java.util.concurrent.atomic.AtomicLong(0)
+    private val inputResets = java.util.concurrent.atomic.AtomicLong(0)
+
     private val outLock = Object()
     private val fifo = FloatFifo((rate * OUTPUT_SECONDS).toInt().coerceAtLeast(rate / 2))
 
     /**
-     * Converted audio is only served once this much has queued up.
-     *
-     * The queue exists to absorb the gap between backend blocks: RVC emits
-     * 250 ms of audio per 200-300 ms of input, so a level of one block keeps
-     * the stream fed without adding a whole extra block of delay. If the
-     * target app jitters more than that, [onUnderrun] raises it — and it
-     * decays again after a long clean stretch.
+     * Converted audio waiting to be served. Bigger than one backend block: the
+     * engine emits in bursts, and the queue has to absorb the gap between two.
      */
-    @Volatile private var blockMs = 0
-    @Volatile private var primeMs = 300
-    private val primeSamples: Int get() = rate * primeMs / 1000
-    /** Emits this session; only used to tell cold-start dropouts apart. */
-    private var emittedBlocks = 0
-    private var primed = false
-    private var cleanBlocks = 0
-    private var lastTrimAt = 0L
 
     @Volatile private var running = true
     @Volatile private var engine: LiveProcessor? = null
@@ -125,13 +108,23 @@ class HookSession(
     /** Capture samples dropped when the engine took over (16 kHz). */
     @Volatile private var inputBase = 0L
 
+    /**
+     * Input index (16 kHz) that output sample 0 of the current processor
+     * corresponds to. The processor numbers its own output from zero, while the
+     * ring keeps counting capture, so the two have to be related to time the
+     * real delay.
+     */
+    @Volatile private var latencyBase = 0L
+
     init {
         Log.d(TAG, "session ${System.identityHashCode(this)} for $key")
     }
 
     private val worker = Thread(::loop, "hook-${pkg.takeLast(12)}-${rate}").also {
         it.isDaemon = true
-        it.priority = Thread.NORM_PRIORITY + 2
+        // Inference runs here: give it the audio priority so a busy app or a
+        // background cgroup cannot starve the engine below realtime.
+        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) }
         it.start()
     }
 
@@ -145,7 +138,6 @@ class HookSession(
             lookaheadMs = (pending.coerceAtLeast(0L) * 1000 / 16_000).toInt(),
             queueMs = queued * 1000 / rate.coerceAtLeast(1),
             inferMs = lastInferMs,
-            primeMs = primeMs,
             baseSamples = inputBase,
             measuredMs = lastLatencyMs,
         )
@@ -160,127 +152,71 @@ class HookSession(
     fun baseSamples(): Long = inputBase
 
     /**
-     * Feeds one capture buffer and returns its converted audio, or an empty
-     * array while the stream is priming. Never a partial buffer: the caller
-     * writes either the whole conversion or nothing, so a buffer never mixes
-     * raw and converted audio.
+     * Feeds one capture buffer and returns whatever converted audio is ready,
+     * up to [pcm] frames.
+     *
+     * This never waits for output on purpose. The caller is the only thread
+     * that can feed the engine, so waiting here for audio that requires more
+     * input would deadlock — it did, and it stalled every recording. Blocking
+     * belongs on the target's audio thread (see [HookTap.await]), where waiting
+     * costs nothing but delay and no sample can be lost.
      */
     fun exchange(pcm: FloatArray): FloatArray {
         lastUse = System.currentTimeMillis()
         HookBridge.touch(key)
+        inFrames.addAndGet(pcm.size.toLong())
         val mono16 = inResampler.process(pcm)
         if (mono16.isNotEmpty()) {
             gate.setThresholdDb(gateDb)
             gate.process(mono16)
-            val capturedAt = System.currentTimeMillis()
             synchronized(inLock) {
                 for (v in mono16) {
                     val slot = (received % ring.size).toInt()
                     ring[slot] = v
-                    ringAt[slot] = capturedAt
                     received++
                 }
                 inLock.notifyAll()
             }
         }
-        val out = synchronized(outLock) {
-            if (!primed) {
-                if (fifo.size >= primeSamples) {
-                    primed = true
-                    // The engine emits its first blocks in a burst while it
-                    // catches up, so the queue can already be several blocks
-                    // deep. That excess never drains on its own (input and
-                    // output run at the same rate), so drop the oldest audio
-                    // once, here, and start the stream at the target depth.
-                    if (fifo.size > primeSamples) {
-                        Log.d(TAG, "prime trim ${fifo.size} -> $primeSamples")
-                        dropConverted(fifo.size - primeSamples)
-                    }
-                    Log.d(TAG, "primed with ${fifo.size} frames (prime=$primeMs ms)")
-                } else {
-                    // Keep the backlog bounded even if the app stops reading.
-                    val high = primeSamples + rate / 20
-                    if (fifo.size > high) {
-                        Log.d(TAG, "trim queue ${fifo.size} -> $primeSamples")
-                        dropConverted(fifo.size - primeSamples)
-                    }
-                    return FloatArray(0)
-                }
-            }
-            // High-water trim. Catch-up after a slow first block pushes whole
-            // blocks of already-stale audio into the queue, and the level never
-            // comes back down on its own (input and output run at the same
-            // rate), so it has to be cut once. Only a full block of excess is
-            // dropped, at most every couple of seconds, so a steady stream is
-            // never touched: the level's own sawtooth peak is already one block
-            // above the target.
-            val high = primeSamples + (rate * blockMs / 1000).coerceAtLeast(rate / 10)
-            val now = System.currentTimeMillis()
-            if (fifo.size > high && now - lastTrimAt > 2_000) {
-                Log.d(TAG, "queue trim ${fifo.size} -> $primeSamples")
-                dropConverted(fifo.size - primeSamples)
-                lastTrimAt = now
-            }
-            val ready = fifo.read(pcm.size)
-            if (ready == null) {
-                // Underrun: the target app is reading faster than the backend
-                // emits. Ask for more cushion next time instead of splicing
-                // raw audio into a converted stream every few buffers.
-                primed = false
-                onUnderrun()
-                Log.d(TAG, "underrun, fifo=${fifo.size} want=${pcm.size} prime=$primeMs")
-                FloatArray(0)
-            } else {
-                // Real delay: the first sample of this buffer was captured at
-                // ringAt[delivered + dropped] and is only now handed over.
-                // delivered counts output samples, the ring counts 16 kHz
-                // capture samples, so convert before indexing.
-                val slot = (((delivered + outDropped) * 16_000 / rate) % ring.size).toInt()
-                val at = ringAt[slot]
-                if (at > 0) lastLatencyMs = now - at
-                delivered += ready.size
-                ready
-            }
-        }
-        return out
-    }
-
-    /** Drops the oldest converted audio; caller holds [outLock]. */
-    private fun dropConverted(n: Int) {
-        fifo.dropOldest(n)
-        outDropped += n
-    }
-
-    /** Grows the cushion by 100 ms, up to 800 ms; shared by every session. */
-    private fun onUnderrun() {
-        // A dropout in the first blocks is the cold engine, not a property of
-        // the stream; learning from it costs the whole call ~200 ms of delay
-        // for a transient that is over after a second.
-        if (emittedBlocks <= WARMUP_BLOCKS) return
-        val next = (primeMs + 100).coerceAtMost(800)
-        primeMs = next
-        learnedPrimeMs = next
-    }
-
-    private fun setPrime(ms: Int) {
-        if (ms != primeMs) Log.d(TAG, "prime ${primeMs} -> ${ms} ms")
-        primeMs = ms
-        learnedPrimeMs = ms
+        if (!running) return EMPTY
+        return serve(pcm.size)
     }
 
     /**
-     * Floor for the cushion: one backend block. The queue has to carry the gap
-     * between bursts, and the burst itself adds the block back, so a block is
-     * the smallest level that never drains to zero. Measured at the emit
-     * instant the level sits at ~144 ms against a 250 ms block, so the queue
-     * carries about one block and is not the dominant term of the delay.
+     * Hands over converted audio already queued, without feeding anything. A
+     * waiting read uses this when the target sends no new capture: the engine
+     * may still owe audio that was fed earlier.
      */
-    private fun minPrime(): Int = maxOf(120, blockMs)
+    fun drain(max: Int): FloatArray {
+        if (!running) return EMPTY
+        return serve(max)
+    }
+
+    private fun serve(max: Int): FloatArray {
+        val out = synchronized(outLock) { fifo.take(max) }
+        if (out.isEmpty()) return out
+        outFrames.addAndGet(out.size.toLong())
+        // Real delay, measured on monotonic counters instead of timestamps:
+        // how much capture has been fed but not yet handed back. Counters wrap
+        // nothing, while ring slots wrap every few seconds.
+        val served16 = latencyBase + delivered * 16_000 / rate
+        val behind = (received - served16).coerceAtLeast(0L)
+        lastLatencyMs = behind * 1000 / 16_000
+        delivered += out.size
+        return out
+    }
 
     fun close() {
         running = false
         synchronized(inLock) { inLock.notifyAll() }
+        synchronized(outLock) { outLock.notifyAll() }
         runCatching { worker.join(700) }
+        Log.i(
+            TAG,
+            "summary $key in=${inFrames.get()} out=${outFrames.get()} stalls=${stalls.get()} " +
+                "stallMs=${stallMs.get()} raw=${rawBlocks.get()} resets=${inputResets.get()} " +
+                "infer=${"%.1f".format(lastInferMs)}ms rtf=${"%.2f".format(lastInferMs / 10.0)}",
+        )
     }
 
     // ------------------------------------------------------------- worker
@@ -315,10 +251,13 @@ class HookSession(
                 if (received < processor.requiredSamples) continue
                 if (received - processor.outputSamples > ring.size * 3L / 4) {
                     // More than a ring behind: the queued input is already
-                    // stale, so restart instead of playing it back late.
+                    // stale. Resetting loses capture, so it is counted as a
+                    // defect rather than being treated as normal operation.
+                    inputResets.incrementAndGet()
+                    Log.w(TAG, "input ring overflow, resetting ($key)")
                     processor.reset()
-                    received = 0
-                    synchronized(outLock) { fifo.clear(); primed = false; delivered = 0; outDropped = 0 }
+                    latencyBase = received
+                    synchronized(outLock) { fifo.clear(); delivered = 0 }
                     continue
                 }
                 start = max(0, (processor.outputSamples - 560).toInt())
@@ -335,36 +274,42 @@ class HookSession(
                 val part = processor.next(source)
                 lastInferMs = (System.nanoTime() - t0) / 1_000_000.0
                 if (part.audio.isEmpty()) continue
-                emittedBlocks++
                 val resampler = outResampler ?: continue
                 val out = resampler.process(part.audio)
-                // Size the prefill from the backend's real block length: two
-                // blocks absorb the gap between bursts without adding more
-                // delay than the backend already has.
-                val ms = out.size * 1000 / rate
-                if (ms > blockMs) {
-                    blockMs = ms
-                    // Start at one block: the native pipeline emits 250 ms per
-                    // 200-300 ms of input, so a single block absorbs the gap.
-                    // A session that underruns grows this (onUnderrun) and the
-                    // value is shared with later sessions in this process.
-                    if (learnedPrimeMs > 0) primeMs = learnedPrimeMs else setPrime(ms)
+                // Latency breakdown: what the model still needs before it can
+                // emit (lookahead), what is waiting in the output queue, and how
+                // long one inference took.
+                val lookMs = ((processor.requiredSamples - processor.outputSamples)
+                    .coerceAtLeast(0L) * 1000 / 16_000).toInt()
+                // `lag` is capture queued but not converted yet; `done` is how
+                // much audio the engine has consumed since the stream started.
+                // Together with the log timestamp they say whether the engine
+                // keeps up with realtime.
+                val lagMs = ((received - processor.outputSamples).coerceAtLeast(0L) * 1000 / 16_000).toInt()
+                Log.d(TAG, "block in=${part.audio.size} out=${out.size} look=${lookMs}ms " +
+                    "lag=${lagMs}ms done=${processor.outputSamples * 1000 / 16_000}ms " +
+                    "fifo=${fifo.size * 1000 / rate}ms lat=${lastLatencyMs}ms " +
+                    "infer=${"%.1f".format(lastInferMs)}ms")
+                if (out.isNotEmpty()) {
+                    synchronized(outLock) {
+                        // Never trim: if the consumer is behind, wait for it.
+                        while (running && fifo.free < out.size) outLock.wait(20)
+                        if (running) {
+                            fifo.write(out)
+                            outLock.notifyAll()
+                        }
+                    }
                 }
-                cleanBlocks++
-                if (cleanBlocks >= 50 && primeMs > minPrime()) {
-                    // Ten seconds without a dropout: creep back towards the
-                    // minimum instead of keeping the learned cushion forever.
-                    cleanBlocks = 0
-                    setPrime(maxOf(minPrime(), primeMs - 50))
-                }
-                Log.d(TAG, "block in=${part.audio.size} out=${out.size} fed=${processor.outputSamples} recv=$received fifo=${fifo.size} prime=${primeSamples} lat=${lastLatencyMs}ms infer=${"%.1f".format(lastInferMs)}ms")
-                if (out.isNotEmpty()) synchronized(outLock) { fifo.write(out) }
             } catch (t: Throwable) {
                 Log.w(TAG, "conversion failed, restarting: ${t.message}")
                 status = "error: ${t.message}"
                 runCatching { processor.reset() }
-                synchronized(inLock) { received = 0 }
-                synchronized(outLock) { fifo.clear(); primed = false; delivered = 0; outDropped = 0 }
+                synchronized(inLock) {
+                    // Same rule as the engine hand-over: never zero the capture
+                    // counter while the producer may be waiting for output.
+                    latencyBase = received
+                }
+                synchronized(outLock) { fifo.clear(); delivered = 0 }
                 Thread.sleep(100)
             }
         }
@@ -390,16 +335,20 @@ class HookSession(
         EngineHub.warmup(built)
         outResampler = StreamResampler(built.outputRate, rate)
         synchronized(inLock) {
-            // The warm-up ran while the app was already being heard, so the
-            // ring holds a second or two of stale capture. Keeping it does not
-            // just add that much delay once: the engine consumes input at the
-            // same rate it emits output, so a backlog never drains — it stays
-            // in the stream for the whole call. Start the new processor on an
-            // empty ring and let it fill from live audio instead.
-            inputBase = received
-            received = 0
+            // The capture queued while the engine loaded is converted, not
+            // dropped. Zeroing the counter here told the worker that no input
+            // existed, while the only thread that could supply more was already
+            // waiting for output — that deadlocked the stream.
+            // No counter reset: output sample zero is input sample zero.
+            latencyBase = 0
+            if (received > ring.size) {
+                // The ring wrapped, so its index zero is no longer the start of
+                // this stream; the oldest capture is gone either way.
+                inputResets.incrementAndGet()
+            }
+            inputBase = 0
         }
-        synchronized(outLock) { fifo.clear(); primed = false; delivered = 0; outDropped = 0 }
+        synchronized(outLock) { fifo.clear(); delivered = 0 }
         engine = built
         Log.i(TAG, "engine for $key: ${built.javaClass.simpleName} @${built.outputRate} Hz -> $rate Hz")
         return built

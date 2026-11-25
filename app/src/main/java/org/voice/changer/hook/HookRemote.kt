@@ -31,6 +31,9 @@ object HookRemote {
     @Volatile private var cfgAt = 0L
     @Volatile private var refreshing = false
 
+    /** First outcome only: one line per process is enough to tell why audio passes. */
+    private val cfgLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** The hooked app's own context, resolved lazily (it may not exist at load time). */
     private fun context(): Context? {
         app?.let { return it }
@@ -62,15 +65,26 @@ object HookRemote {
             try {
                 val ctx = context()
                 if (ctx != null) {
-                    ctx.contentResolver.call(uri, "config", null, null)?.let { bundle ->
+                    val bundle = ctx.contentResolver.call(uri, "config", null, null)
+                    if (bundle != null) {
                         cfgEnabled = bundle.getBoolean("enabled", false)
                         cfgAll = bundle.getBoolean("all", false)
                         cfgTargets = bundle.getStringArrayList("targets")?.toSet() ?: emptySet()
+                        if (cfgLogged.compareAndSet(false, true)) {
+                            android.util.Log.i(TAG, "config ok: enabled=$cfgEnabled all=$cfgAll targets=$cfgTargets")
+                        }
+                    } else if (cfgLogged.compareAndSet(false, true)) {
+                        android.util.Log.w(TAG, "config returned null")
                     }
+                } else if (cfgLogged.compareAndSet(false, true)) {
+                    android.util.Log.w(TAG, "config skipped: no context")
                 }
             } catch (t: Throwable) {
                 // App not reachable: fail closed, the raw microphone passes.
                 cfgEnabled = false
+                if (cfgLogged.compareAndSet(false, true)) {
+                    android.util.Log.w(TAG, "config failed: $t")
+                }
             } finally {
                 refreshing = false
             }
@@ -100,8 +114,13 @@ object HookRemote {
         }.apply { isDaemon = true }.start()
     }
 
-    fun process(key: String, pkg: String, rate: Int, channels: Int, pcm: FloatArray): FloatArray {
-        val ctx = context() ?: return EMPTY
+    /**
+     * Sends one capture buffer; returns the converted audio that is ready, an
+     * empty array when the buffer was accepted but nothing is converted yet,
+     * or null when the buffer was not accepted at all and must be retried.
+     */
+    fun process(key: String, pkg: String, rate: Int, channels: Int, pcm: FloatArray): FloatArray? {
+        val ctx = context() ?: return null
         return try {
             val extras = Bundle().apply {
                 putString("key", key)
@@ -110,10 +129,27 @@ object HookRemote {
                 putInt("channels", channels)
                 putFloatArray("pcm", pcm)
             }
-            val reply = ctx.contentResolver.call(uri, "process", null, extras) ?: return EMPTY
-            reply.getFloatArray("pcm") ?: EMPTY
+            val reply = ctx.contentResolver.call(uri, "process", null, extras) ?: return null
+            reply.getFloatArray("pcm")
         } catch (t: Throwable) {
-            EMPTY
+            null
+        }
+    }
+
+    /**
+     * Pulls converted audio that is already queued for [key], without sending
+     * new capture. Used when a read is waiting and no new audio has arrived.
+     */
+    fun drain(key: String): FloatArray? {
+        val ctx = context() ?: return null
+        return try {
+            val reply = ctx.contentResolver.call(uri, "process", null, Bundle().apply {
+                putString("key", key)
+                putFloatArray("pcm", FloatArray(0))
+            }) ?: return null
+            reply.getFloatArray("pcm")
+        } catch (t: Throwable) {
+            null
         }
     }
 

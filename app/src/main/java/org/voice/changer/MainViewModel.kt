@@ -563,8 +563,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun startLive() {
         if (_state.value.busy || _state.value.live || !_state.value.ready) return
         if (EngineHub.processor == null) return
-        // Both modes want the same stateful engine; the microphone loop wins
-        // and the hook passes raw audio through while it runs.
+        // Both modes want the same stateful engine, and a hooked stream must
+        // never fall back to raw audio, so the live loop waits for it to end.
+        if (org.voice.changer.hook.HookBridge.isActive()) {
+            _state.value = _state.value.copy(
+                error = "变声转换正在进行，等目标 App 停止录音后再试听",
+            )
+            return
+        }
         if (_state.value.hookEnabled) {
             HookSettings.setEnabled(getApplication(), false)
             _state.value = _state.value.copy(hookEnabled = false)

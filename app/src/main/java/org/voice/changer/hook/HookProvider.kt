@@ -27,6 +27,13 @@ class HookProvider : ContentProvider() {
     override fun onCreate(): Boolean {
         val ctx = context ?: return false
         HookBridge.attach(ctx)
+        // Process start is the earliest point the engine can be loaded, and the
+        // latest that still pays off: the first capture buffer is seconds away.
+        HookBridge.warm()
+        // Keep the process out of the cached cgroup. Starting a foreground
+        // service from the background is restricted, so this may fail; the
+        // settings screen starts it reliably when the hook is switched on.
+        if (HookSettings.enabled(ctx)) runCatching { org.voice.changer.LiveService.startHookMode(ctx) }
         Log.i(TAG, "provider ready")
         return true
     }

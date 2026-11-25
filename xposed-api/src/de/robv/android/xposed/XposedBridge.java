@@ -7,7 +7,13 @@ import java.util.Set;
 public final class XposedBridge {
     private XposedBridge() {}
 
-    public static Object hookMethod(Member method, XC_MethodHook callback) {
+    /**
+     * Returns [XC_MethodHook.Unhook] in the real API. Declaring it as
+     * `Object` compiles but produces a call site the framework cannot
+     * resolve: `NoSuchMethodError: No static method hookMethod(...)
+     * Ljava/lang/Object;` — the descriptor is part of the lookup.
+     */
+    public static XC_MethodHook.Unhook hookMethod(Member method, XC_MethodHook callback) {
         throw new UnsupportedOperationException("stub");
     }
 
