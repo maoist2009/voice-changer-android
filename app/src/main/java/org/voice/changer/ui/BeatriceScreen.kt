@@ -80,6 +80,7 @@ fun BeatriceScreen(vm: MainViewModel, onNavigate: (Page) -> Unit) {
 
         if (state.ready && !state.isRvc) {
             BeatriceParams(state, vm)
+            LatencyCard(state, vm)
         }
 
         PipelineCard(
@@ -98,9 +99,41 @@ fun BeatriceScreen(vm: MainViewModel, onNavigate: (Page) -> Unit) {
     }
 }
 
+/**
+ * The one Beatrice control that changes the graph rather than its output: the
+ * frames per inference, which is both the interval between emissions and the
+ * look-ahead the delay is made of.
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BeatriceParams(state: MainViewModel.UiState, vm: MainViewModel) {
-    Card(
+private fun LatencyCard(state: MainViewModel.UiState, vm: MainViewModel) {
+    SectionCard(title = "Latency") {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                12 to "Smooth · 120 ms",
+                8 to "Balanced · 80 ms",
+                4 to "Low latency · 40 ms",
+            ).forEach { (frames, label) ->
+                FilterChip(
+                    selected = state.chunkFrames == frames,
+                    onClick = { vm.setChunkFrames(frames) },
+                    label = { Text(label) },
+                )
+            }
+        }
+        Hint(
+            "Block size: how often the engine runs and how much audio it emits, " +
+                "10 ms per frame. It also sets the look-ahead (262 / 182 / 102 ms), " +
+                "which is what the delay is made of, and the CPU per second of " +
+                "audio. The graphs are rebuilt from the same weights, so the voice " +
+                "does not change. A conversion that is already running keeps the " +
+                "size it started with; the new one applies from the next start.",
+        )
+    }
+}
+
+@Composable
+private fun BeatriceParams(state: MainViewModel.UiState, vm: MainViewModel) {    Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         modifier = Modifier.fillMaxWidth(),
     ) {

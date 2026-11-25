@@ -107,18 +107,22 @@ object HookAudio {
         tap.enqueue(mono)
         // At stream start the engine cannot emit until it has its start-up
         // context, and only this thread can supply that capture. Read exactly the
-        // reported deficit, then give the backend the time one block needs; if it
-        // still wants more, top it up one buffer at a time. Reading past the
-        // deficit is permanent delay: the app consumes at realtime, so a surplus
-        // can never drain. Measured: read-ahead guesses left 0.5-1.5 s in the
-        // stream for every recording.
+        // reported deficit plus two buffers of rounding slack, then give the
+        // backend the time its first block needs; if it still wants more, top it
+        // up one buffer at a time. Reading past that is permanent delay: the app
+        // consumes at realtime, so a surplus can never drain. Measured: read-ahead
+        // guesses left 0.5-1.5 s in the stream for every recording.
         var out: FloatArray? = null
         if (tap.primed) {
             out = tap.tryAwait(mono.size, PREROLL_WAIT_MS)
         } else {
             var rounds = 0
             while (out == null && rounds++ < PREROLL_RETRIES) {
-                val target = tap.preRollTarget()
+                // The first ask usually lands while the engine is still being
+                // built, which reports zero demand; once it is up, the deficit is
+                // exact and the read-ahead can stop on a frame boundary.
+                tap.fetchNeed()
+                val target = tap.preRollTarget(2 * mono.size)
                 preRoll(
                     param, args, channels, encoding, start, tap, mono.size,
                     if (target > 0) target else mono.size, tracing,
@@ -136,13 +140,13 @@ object HookAudio {
             if (tracing) trace("skip: nothing converted")
             return
         }
-        // The engine emits in blocks, so a target buffer can straddle a block
-        // boundary. Hand back a short read instead of bailing out: bailing would
-        // leave the raw capture in the buffer (a raw leak), and waiting for a
-        // full buffer deadlocks the pipeline, because the input needed to make
-        // the next block can only come from this very read.
-        val short = out.size != mono.size
-        if (short && tracing) trace("short read in=${mono.size} out=${out.size}")
+        // Both queues are all-or-nothing in frames, so this cannot differ; if it
+        // ever does, wait for the rest rather than writing a buffer that only
+        // partly replaced the capture (the remainder would be raw audio).
+        if (out.size != mono.size) {
+            if (tracing) trace("partial ${out.size}/${mono.size} frames")
+            return
+        }
         val n = converts.incrementAndGet()
         if (n <= 3) {
             trace(
@@ -152,7 +156,6 @@ object HookAudio {
             )
         }
         writeMono(args[0], args, read, channels, encoding, out, start)
-        if (short) reportShort(param, args[0], out.size, channels, encoding, start)
         val t3 = System.nanoTime()
         cpuNs.addAndGet((t1 - t0) + (t3 - t2))
         blockNs.addAndGet(t2 - t1)
@@ -184,14 +187,13 @@ object HookAudio {
         targetFrames: Int,
         tracing: Boolean,
     ) {
-        if (tap.hasOutput(need)) return
         val method = param.method as? java.lang.reflect.Method ?: return
         val t0 = System.nanoTime()
         var rounds = 0
         var frames = 0
         preRolling.set(true)
         try {
-            while (frames < targetFrames && !tap.hasOutput(need)) {
+            while (frames < targetFrames) {
                 if ((System.nanoTime() - t0) / 1_000_000 >= PREROLL_READ_MS) break
                 // Re-enters the hook, which returns immediately because of the
                 // thread-local flag, and leaves raw capture in the buffer.
@@ -204,37 +206,13 @@ object HookAudio {
                 rounds++
             }
             if (tracing) {
-                trace("pre-roll rounds=$rounds frames=$frames target=$targetFrames ready=${tap.hasOutput(need)}")
+                trace("pre-roll rounds=$rounds frames=$frames target=$targetFrames ready=${tap.hasOutput(1)}")
             }
         } catch (t: Throwable) {
             trace("pre-roll stopped: ${t.javaClass.simpleName}: ${t.message}")
         } finally {
             preRolling.set(false)
         }
-    }
-
-    /**
-     * Reports a short read in the units the overload uses: elements for the array
-     * overloads, bytes for the ByteBuffer one — whose position must also move to
-     * where the converted audio ends, since the raw read already moved it.
-     */
-    private fun reportShort(
-        param: XC_MethodHook.MethodHookParam,
-        target: Any?,
-        frames: Int,
-        channels: Int,
-        encoding: Int,
-        start: Int?,
-    ) {
-        val perFrame =
-            if (target is ShortArray || target is FloatArray) channels
-            else channels * bytesPerSample(encoding)
-        val count = frames * perFrame
-        if (target is ByteBuffer) {
-            val at = (start ?: (target.position() - count)) + count
-            runCatching { target.position(at.coerceIn(0, target.capacity())) }
-        }
-        param.result = count
     }
 
     private fun rms(a: FloatArray): Float {

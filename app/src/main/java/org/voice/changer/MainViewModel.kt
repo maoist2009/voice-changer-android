@@ -87,6 +87,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val indexRate: Float = 0f,
         val nprobe: Int = 0,
         val noiseGate: Float = -50f,
+        /** Beatrice's frames per inference; see [EngineParams.chunkFrames]. */
+        val chunkFrames: Int = EngineHub.DEFAULT_CHUNK_FRAMES,
         /** Labels for the backend that is not resident, read from disk. */
         val rvcName: String? = null,
         val rvcSubtitle: String? = null,
@@ -145,6 +147,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             indexRate = prefs.getFloat("indexRate", 0f),
             nprobe = prefs.getInt("nprobe", 0),
             noiseGate = prefs.getFloat("noiseGate", -50f),
+            chunkFrames = EngineHub.normalizeChunk(
+                prefs.getInt("chunkFrames", EngineHub.DEFAULT_CHUNK_FRAMES),
+            ),
             hookEnabled = HookSettings.enabled(app),
             hookAll = HookSettings.allApps(app),
             hookTargets = HookSettings.targets(app),
@@ -276,6 +281,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun params(s: UiState): EngineParams = EngineParams(
         pitchShift = s.pitch.toDouble(),
+        chunkFrames = s.chunkFrames,
         formantShift = s.formant.toDouble(),
         intonationIntensity = s.intonation.toDouble(),
         pitchCorrection = s.correction.toDouble(),
@@ -518,6 +524,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setIndexRate(v: Float) { _state.value = _state.value.copy(indexRate = v); applyParams() }
     fun setNprobe(v: Int) { _state.value = _state.value.copy(nprobe = v); applyParams() }
     fun setNoiseGate(v: Float) { _state.value = _state.value.copy(noiseGate = v); applyParams() }
+
+    /**
+     * Beatrice's frames per inference: the interval between emissions and the
+     * size of each one. The graphs are built per value, so an idle engine is
+     * rebuilt right away; a conversion that is already running keeps the value
+     * it was built at, and this one lands on the next start.
+     */
+    fun setChunkFrames(v: Int) {
+        val chunk = EngineHub.normalizeChunk(v)
+        val s = _state.value
+        if (s.chunkFrames == chunk) return
+        _state.value = s.copy(chunkFrames = chunk)
+        prefs.edit().putInt("chunkFrames", chunk).apply()
+        if (s.backend != Backend.BEATRICE || EngineHub.chunkFrames == chunk) return
+        if (s.busy || s.live || HookBridge.isActive()) {
+            _state.value = _state.value.copy(
+                message = "Block size saved; it applies from the next conversion",
+            )
+            return
+        }
+        EngineHub.reset()
+        loadEngine(force = true)
+    }
 
     /**
      * Retrieval is staged with the voice: the index is only read when the

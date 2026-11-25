@@ -1,6 +1,7 @@
 package org.voice.changer.hook
 
 import android.content.Context
+import org.voice.changer.engine.EngineHub
 import org.voice.changer.engine.EngineParams
 
 /**
@@ -53,6 +54,9 @@ object HookSettings {
         val p = prefs(context)
         return EngineParams(
             pitchShift = p.getFloat("pitch", 0f).toDouble(),
+            chunkFrames = EngineHub.normalizeChunk(
+                p.getInt("chunkFrames", EngineHub.DEFAULT_CHUNK_FRAMES),
+            ),
             formantShift = p.getFloat("formant", 0f).toDouble(),
             intonationIntensity = p.getFloat("intonation", 1f).toDouble(),
             pitchCorrection = p.getFloat("correction", 0f).toDouble(),

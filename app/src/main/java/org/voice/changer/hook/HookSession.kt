@@ -170,6 +170,23 @@ class HookSession(
     }
 
     /**
+     * Capture the stream must provide before the backend can emit anything at
+     * all, in frames at the target rate — an absolute figure, not a deficit.
+     *
+     * The caller tracks what it has fed on its own side; here [received] only
+     * counts what has made the binder round trip, so a deficit computed from it
+     * lags by a buffer or two and made the read-ahead stop short of the first
+     * block (measured: 400 ms of read-ahead against a 425 ms context, which
+     * deadlocked on the second block).
+     */
+    fun coldStartWithin(maxMs: Long): Int {
+        val deadline = System.currentTimeMillis() + maxMs
+        while (engine == null && System.currentTimeMillis() < deadline) Thread.sleep(10)
+        val e = engine ?: return 0
+        return (e.coldStartSamples * rate / 16_000).toInt()
+    }
+
+    /**
      * Same as [neededFrames] but waits up to [maxMs] for the engine to exist.
      * A guess here is expensive twice over: too small deadlocks the stream, too
      * large turns into permanent delay.

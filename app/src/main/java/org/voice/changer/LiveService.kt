@@ -78,7 +78,7 @@ class LiveService : Service() {
                 // The process may have been restarted by the system after a kill.
                 Thread {
                     try {
-                        EngineHub.ensureDefault(this, pendingParams ?: EngineParams())
+                        EngineHub.ensureDefault(this, buildParams())
                         val engine = EngineHub.processor
                             ?: error("The engine could not be created")
                         startEngine(engine, intent)
@@ -95,7 +95,7 @@ class LiveService : Service() {
             // ~1.5 s model load (during which the app hears itself raw).
             Thread {
                 runCatching {
-                    EngineHub.ensureDefault(this, pendingParams ?: EngineParams())
+                    EngineHub.ensureDefault(this, buildParams())
                     EngineHub.processor?.let { EngineHub.warmup(it) }
                 }.onFailure { Log.w(TAG, "hook preload failed: ${it.message}") }
             }.start()
@@ -103,10 +103,18 @@ class LiveService : Service() {
         return START_STICKY
     }
 
+    /**
+     * Parameters to build or reconfigure with. A restart arrives with no UI
+     * around to push them, so fall back to the persisted set instead of the
+     * built-in defaults (which would silently drop the user's tuning, and the
+     * Beatrice block size along with it).
+     */
+    private fun buildParams(): EngineParams = pendingParams ?: HookSettings.engineParams(this)
+
     private fun startEngine(processor: LiveProcessor, intent: Intent?) {
         Log.i(TAG, "starting engine: ${processor.javaClass.simpleName} @${processor.outputRate} Hz")
         val engine = LiveEngine(processor)
-        engine.setParams(pendingParams ?: EngineParams())
+        engine.setParams(buildParams())
         engine.wantScope = metersEnabled
         engine.onStats = { stats -> onStats?.invoke(stats) }
         engine.onScope = { scope -> onScope?.invoke(scope) }

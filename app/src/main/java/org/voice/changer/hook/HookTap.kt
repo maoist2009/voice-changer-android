@@ -88,9 +88,9 @@ class HookTap(
         private set
 
     /**
-     * Capture this stream must read ahead (frames at [rate]) before the engine
-     * can emit its first block, as reported by the app side. Zero means the
-     * engine has not been built yet.
+     * Capture this stream must supply (frames at [rate]) before the engine can
+     * emit its first block, as reported by the app side. Absolute, so the caller
+     * subtracts what it has already fed. Zero means the engine is not built yet.
      */
     @Volatile var needFrames = 0
         private set
@@ -127,18 +127,29 @@ class HookTap(
     }
 
     /**
-     * Capture this stream still has to read ahead (frames at [rate]) to satisfy
-     * the engine's start-up context. Zero when the app side has not reported a
-     * demand yet.
+     * Capture this stream still has to supply (frames at [rate]) so the engine
+     * can keep producing while a read waits.
+     *
+     * [margin] is the rounding slack: the backend emits in fixed blocks and a
+     * read buffer rarely lands on a block boundary, so the capture that fills
+     * the next block can be less than one whole buffer away. Without the slack
+     * the read that would supply it is the very read waiting for output.
+     * Measured: exact context alone leaves the stream a few ms short of the
+     * second block and it never recovers.
      */
-    fun preRollTarget(): Int {
+    fun preRollTarget(margin: Int): Int {
         if (needFrames <= 0) return 0
-        return (needFrames - fedFrames.get()).coerceAtLeast(0L).toInt()
+        return (needFrames + margin - fedFrames.get()).coerceAtLeast(0L).toInt()
     }
 
     /**
      * Waits for [n] converted frames. Returns null only when the stream is
      * being torn down, which the caller counts as a defect.
+     *
+     * Deliberately all-or-nothing: a read hands back exactly as much capture as
+     * it was given, so partly filling the buffer would feed the engine audio
+     * that never reaches the target again. Measured cost of short reads:
+     * +50 ms of delay per 250 ms block, 3 s over a 15 s call.
      */
     fun await(n: Int): FloatArray? {
         val t0 = System.nanoTime()

@@ -14,6 +14,15 @@ data class EngineParams(
     val outputGain: Double = 1.0,
 
     // ---- Beatrice rc.0 ----
+    /**
+     * Frames per inference: both the interval between emissions and the size of
+     * each one (10 ms per frame). 12 / 8 / 4 give 120 / 80 / 40 ms blocks and
+     * 262 / 182 / 102 ms of look-ahead. The graphs are built per value from the
+     * same weights, so this trades CPU headroom for latency, not quality; it is
+     * snapped to a multiple of four. Unlike the fields below, changing it needs
+     * the engine rebuilt, so it takes effect on the next conversion.
+     */
+    val chunkFrames: Int = EngineHub.DEFAULT_CHUNK_FRAMES,
     val averageSourcePitch: Double = 52.0,
     val intonationIntensity: Double = 1.0,
     val pitchCorrection: Double = 0.0,

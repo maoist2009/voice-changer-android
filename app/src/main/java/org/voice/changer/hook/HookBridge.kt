@@ -252,7 +252,7 @@ object HookBridge {
             engage(key, pkg, rate, channels, ctx) ?: return Bundle()
         }
         return Bundle().apply {
-            putInt("need", session.needWithin(300))
+            putInt("need", session.coldStartWithin(300))
             putInt("firstMs", session.firstBlockMs())
         }
     }

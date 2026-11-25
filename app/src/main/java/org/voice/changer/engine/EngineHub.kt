@@ -46,7 +46,18 @@ object EngineHub {
      * of four). 8 leaves 2-3x headroom, which is what a screen-off recording
      * needs when the device is busy.
      */
-    const val CHUNK_FRAMES = 8
+    const val DEFAULT_CHUNK_FRAMES = 8
+
+    /** The smallest chunk the phone extractor's graphs can be built at. */
+    const val MIN_CHUNK_FRAMES = 4
+
+    private const val MAX_CHUNK_FRAMES = 40
+
+    /** Snaps a user choice onto the grid the graphs are built on (multiples of four). */
+    fun normalizeChunk(frames: Int): Int {
+        val clamped = frames.coerceIn(MIN_CHUNK_FRAMES, MAX_CHUNK_FRAMES)
+        return (clamped / 4) * 4
+    }
     const val ATTN_POSITIONS = 64
 
     private const val TAG = "engine_hub"
@@ -59,26 +70,33 @@ object EngineHub {
 
     private var rc0: Rc0Processor? = null
     private var rvc: RvcProcessor? = null
+    /** Chunk the resident rc.0 engine was built at; 0 when nothing is loaded. */
+    @Volatile private var rc0Chunk = 0
+
+    /** Frames per inference the resident Beatrice engine runs at, 0 if none. */
+    val chunkFrames: Int get() = rc0Chunk
 
     @Volatile private var qnnReady = false
 
     /** Builds the rc.0 engine at most once, even when two activities race a cold start. */
     @Synchronized
     fun ensureBeatrice(dir: File, params: EngineParams): EngineInfo {
+        val chunk = normalizeChunk(params.chunkFrames)
         val existing = rc0
         val loaded = info
-        if (existing != null && loaded?.backend == Backend.BEATRICE) return loaded
+        if (existing != null && loaded?.backend == Backend.BEATRICE && rc0Chunk == chunk) return loaded
 
         release()
         val parsed = ModelLoader.load(dir)
         val created = Rc0Processor.create(
             OrtEnvironment.getEnvironment(),
             parsed,
-            chunkFrames = CHUNK_FRAMES,
+            chunkFrames = chunk,
             attnPositions = ATTN_POSITIONS,
             params = params,
         )
         rc0 = created
+        rc0Chunk = chunk
         processor = created
         val info = EngineInfo(
             backend = Backend.BEATRICE,
@@ -231,6 +249,7 @@ object EngineHub {
         info = null
         rc0 = null
         rvc = null
+        rc0Chunk = 0
         // The microphone loop holds its own reference and stops asynchronously;
         // anything else (UI, hook bridge) must not keep a dead native context.
         if (!LiveService.micActive) runCatching { old?.close() }
